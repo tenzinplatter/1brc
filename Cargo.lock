@@ -7,6 +7,7 @@ name = "breezy"
 version = "0.1.0"
 dependencies = [
  "gxhash",
+ "madvise",
  "mmap",
 ]
 
@@ -36,6 +37,15 @@ name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+
+[[package]]
+name = "madvise"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e1e75c3c34c2b34cec9f127418cb35240c7ebee5de36a51437e6b382c161b86"
+dependencies = [
+ "libc 0.2.182",
+]
 
 [[package]]
 name = "mmap"

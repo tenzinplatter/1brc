@@ -35,6 +35,9 @@ fn main() {
     .unwrap();
     let slice = slice_from_raw_parts_mut(mmap.data(), file_len);
     let bytes = unsafe { slice.as_ref().unwrap().trim_ascii_end() };
+    unsafe {
+        madvise::madvise(bytes.as_ptr(), bytes.len(), madvise::AccessPattern::Sequential).unwrap();
+    }
 
     let nthreads = std::convert::Into::<usize>::into(std::thread::available_parallelism().unwrap());
     let sections = split_file(bytes, nthreads);

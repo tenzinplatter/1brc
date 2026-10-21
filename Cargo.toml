@@ -8,4 +8,5 @@ debug = true
 
 [dependencies]
 gxhash = "3.5.0"
+madvise = "0.1.0"
 mmap = "0.1.1"
