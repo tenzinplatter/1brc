@@ -1,7 +1,7 @@
 use std::{
     arch::x86_64::{
-        _MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_epi8, _mm256_movemask_epi8,
-        _mm256_set1_epi8,
+        __m256i, _MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_set1_epi8,
     },
     os::fd::AsRawFd,
     ptr::{slice_from_raw_parts, slice_from_raw_parts_mut},
@@ -11,7 +11,7 @@ use std::{
 use mmap::{MapOption, MemoryMap};
 
 const N: usize = 1 << 17;
-const CHUNKSIZE: usize = 32;
+const BLOCKSIZE: usize = 64;
 const SEED: i64 = 123456;
 
 #[derive(Default, Clone)]
@@ -153,112 +153,82 @@ fn set_entry(
 }
 
 #[inline(always)]
+fn split_line(line: &[u8]) -> (&'static [u8], &'static [u8]) {
+    // ';' is at one of len - {4,5,6}
+    let len = line.len();
+    let at_4 = unsafe { *line.get_unchecked(len - 4) } == b';';
+    let at_5 = unsafe { *line.get_unchecked(len - 5) } == b';';
+    let at_6 = unsafe { *line.get_unchecked(len - 6) } == b';';
+
+    let index = len - (at_4 as usize * 4) - (at_5 as usize * 5) - (at_6 as usize * 6);
+    let ptr = line.as_ptr();
+    unsafe {
+        let left = slice_from_raw_parts(ptr, index);
+        let right = slice_from_raw_parts(ptr.add(index + 1), len - index - 1);
+        (left.as_ref().unwrap(), right.as_ref().unwrap())
+    }
+}
+
+#[inline(always)]
 fn iter_lines(bytes: &[u8]) -> Vec<Entry> {
     let mut table = vec![Entry::default(); N];
 
     let newline_needle = unsafe { _mm256_set1_epi8(b'\n' as i8) };
-    let semicolon_needle = unsafe { _mm256_set1_epi8(b';' as i8) };
     let ptr = bytes.as_ptr();
     let bytes_len = bytes.len();
-    let mut semicolon_idx = 0;
-    let mut semicolon_chunks = 0;
     let mut i = 0;
-    let mut chunks = 0;
-    let mut found = false;
-    let mut found_semi = false;
+    let mut line_start = 0;
 
-    'main_loop: while i + CHUNKSIZE <= bytes_len {
-        let (station, temperature) = unsafe {
-            #[allow(unused)]
-            let mut n = 0;
-            while i + CHUNKSIZE <= bytes_len {
-                let haystack = _mm256_loadu_epi8(ptr.add(i) as *const i8);
-                let newline_res = _mm256_cmpeq_epi8(newline_needle, haystack);
-                let newline_mask = _mm256_movemask_epi8(newline_res);
-
-                let semicolon_res = _mm256_cmpeq_epi8(semicolon_needle, haystack);
-                let semicolon_mask = _mm256_movemask_epi8(semicolon_res);
-
-                if semicolon_mask != 0 {
-                    semicolon_idx = semicolon_mask.trailing_zeros();
-                    found_semi = true;
-                }
-
-                if newline_mask != 0 {
-                    n = newline_mask.trailing_zeros();
-                    // newline is at i + n
-                    found = true;
-                    break;
-                }
-
-                chunks += 1;
-                semicolon_chunks += !found_semi as i32;
-                i += CHUNKSIZE;
-            }
-
-            if !found {
-                break 'main_loop;
-            }
-
-            let chunk_offset = CHUNKSIZE * chunks;
-            let line_len = chunk_offset + n as usize;
-            let station_len = (CHUNKSIZE * semicolon_chunks as usize) + semicolon_idx as usize;
-            let station = slice_from_raw_parts(ptr.add(i - chunk_offset), station_len);
-            let temperature = slice_from_raw_parts(
-                ptr.add(i - chunk_offset + station_len + 1),
-                line_len - 1 - station_len,
-            );
-
-            i += 1 + n as usize;
-            chunks = 0;
-            (station.as_ref().unwrap(), temperature.as_ref().unwrap())
+    while i + BLOCKSIZE <= bytes_len {
+        let mut mask = unsafe {
+            let lo = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+            let hi = _mm256_loadu_si256(ptr.add(i + 32) as *const __m256i);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(newline_needle, lo));
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(newline_needle, hi));
+            (lo as u32 as u64) | ((hi as u32 as u64) << 32)
         };
 
-        let hash = gxhash::gxhash64(station, SEED);
-        let slot = (hash as usize) & (N - 1);
-        unsafe {
-            _mm_prefetch::<{ _MM_HINT_T0 }>(table.as_ptr().add(slot) as *const i8);
-        }
-        let temperature = parse_temperature(temperature);
+        while mask != 0 {
+            let line_end = i + mask.trailing_zeros() as usize;
+            mask &= mask - 1;
 
-        let hash = gxhash::gxhash64(station, SEED);
-        let slot = (hash as usize) & (N - 1);
-        set_entry(&mut table, slot, hash, station, temperature);
-    }
-
-    if i < bytes_len {
-        let lines = unsafe {
-            let remainder = slice_from_raw_parts(ptr.add(i), bytes_len - i)
-                .as_ref()
-                .unwrap();
-            remainder.split(|c| *c == b'\n')
-        };
-
-        for line in lines {
-            let (station, temperature) = {
-                // max len: -99.9 - 5 bytes - ';' is at most 6 bytes from end
-                // min len: 0.0 - 3 bytes - ';' is at least 4 bytes
-                // i.e. ';' is at one of len - {4,5,6}
-                let len = line.len();
-                let at_4 = unsafe { *line.get_unchecked(len - 4) } == b';';
-                let at_5 = unsafe { *line.get_unchecked(len - 5) } == b';';
-                let at_6 = unsafe { *line.get_unchecked(len - 6) } == b';';
-
-                let index = len - (at_4 as usize * 4) - (at_5 as usize * 5) - (at_6 as usize * 6);
-                let ptr = line.as_ptr();
-                unsafe {
-                    let left = slice_from_raw_parts(ptr, index);
-                    let right = slice_from_raw_parts(ptr.add(index + 1), len - index - 1);
-                    (left.as_ref().unwrap(), right.as_ref().unwrap())
-                }
+            let line = unsafe {
+                slice_from_raw_parts(ptr.add(line_start), line_end - line_start)
+                    .as_ref()
+                    .unwrap()
             };
+            line_start = line_end + 1;
 
+            let (station, temperature) = split_line(line);
+
+            let hash = gxhash::gxhash64(station, SEED);
+            let slot = (hash as usize) & (N - 1);
+            unsafe {
+                _mm_prefetch::<{ _MM_HINT_T0 }>(table.as_ptr().add(slot) as *const i8);
+            }
             let temperature = parse_temperature(temperature);
 
             let hash = gxhash::gxhash64(station, SEED);
             let slot = (hash as usize) & (N - 1);
             set_entry(&mut table, slot, hash, station, temperature);
         }
+
+        i += BLOCKSIZE;
+    }
+
+    let remainder = unsafe {
+        slice_from_raw_parts(ptr.add(line_start), bytes_len - line_start)
+            .as_ref()
+            .unwrap()
+    };
+
+    for line in remainder.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
+        let (station, temperature) = split_line(line);
+        let temperature = parse_temperature(temperature);
+
+        let hash = gxhash::gxhash64(station, SEED);
+        let slot = (hash as usize) & (N - 1);
+        set_entry(&mut table, slot, hash, station, temperature);
     }
 
     table
